@@ -1,4 +1,4 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+#Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
@@ -50,7 +50,7 @@ def get_args_parser(
     )
     parser.add_argument(
         "--timeout",
-        default=2800,
+        default=4500,
         type=int,
         help="Duration of the job",
     )
@@ -90,6 +90,7 @@ def get_shared_folder() -> Path:
 
 
 def submit_jobs(task_class, args, name: str):
+
     if not args.output_dir:
         args.output_dir = str(get_shared_folder() / "%j")
 
@@ -97,12 +98,17 @@ def submit_jobs(task_class, args, name: str):
     executor = submitit.AutoExecutor(folder=args.output_dir, slurm_max_num_timeout=30)
 
     kwargs = {}
+
+    kwargs["slurm_constraint"]="l40s"
     if args.use_volta32:
         kwargs["slurm_constraint"] = "volta32gb"
     if args.comment:
         kwargs["slurm_comment"] = args.comment
     if args.exclude:
         kwargs["slurm_exclude"] = args.exclude
+    #additional_parameters = {
+    #    "nodelist": "gpu3106"  # Specify the desired node
+    #}
 
     executor_params = get_slurm_executor_parameters(
         nodes=args.nodes,
@@ -110,6 +116,7 @@ def submit_jobs(task_class, args, name: str):
         timeout_min=args.timeout,  # max is 60 * 72
         slurm_signal_delay_s=120,
         slurm_partition=args.partition,
+        #slurm_additional_parameters=additional_parameters,
         **kwargs,
     )
     executor.update_parameters(name=name, **executor_params)
