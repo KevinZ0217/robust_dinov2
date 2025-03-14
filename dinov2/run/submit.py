@@ -1,346 +1,129 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+#Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
 import argparse
 import logging
-import math
 import os
-from functools import partial
+from pathlib import Path
+from typing import List, Optional
 
-from fvcore.common.checkpoint import PeriodicCheckpointer
-import torch
+import submitit
 
-from dinov2.data import SamplerType, make_data_loader, make_dataset
-from dinov2.data import collate_data_and_cast, DataAugmentationDINO, MaskingGenerator, PairedDataAugmentationDINO
-import dinov2.distributed as distributed
-from dinov2.fsdp import FSDPCheckpointer
-from dinov2.logging import MetricLogger
-from dinov2.utils.config import setup
-from dinov2.utils.utils import CosineScheduler
-
-from dinov2.train.ssl_meta_arch import SSLMetaArch
-from dinov2.data.datasets.image_net import _Split
+from dinov2.utils.cluster import (
+    get_slurm_executor_parameters,
+    get_slurm_partition,
+    get_user_checkpoint_path,
+)
 
 
-torch.backends.cuda.matmul.allow_tf32 = True  # PyTorch 1.12 sets this to False by default
 logger = logging.getLogger("dinov2")
 
 
-def get_args_parser(add_help: bool = True):
-    parser = argparse.ArgumentParser("DINOv2 training", add_help=add_help)
-    parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
+def get_args_parser(
+    description: Optional[str] = None,
+    parents: Optional[List[argparse.ArgumentParser]] = None,
+    add_help: bool = True,
+) -> argparse.ArgumentParser:
+    parents = parents or []
+    slurm_partition = get_slurm_partition()
+    parser = argparse.ArgumentParser(
+        description=description,
+        parents=parents,
+        add_help=add_help,
+    )
     parser.add_argument(
-        "--resume",
+        "--ngpus",
+        "--gpus",
+        "--gpus-per-node",
+        default=1,
+        type=int,
+        help="Number of GPUs to request on each node",
+    )
+    parser.add_argument(
+        "--nodes",
+        "--nnodes",
+        default=1,
+        type=int,
+        help="Number of nodes to request",
+    )
+    parser.add_argument(
+        "--timeout",
+        default=4500,
+        type=int,
+        help="Duration of the job",
+    )
+    parser.add_argument(
+        "--partition",
+        default=slurm_partition,
+        type=str,
+        help="Partition where to submit",
+    )
+    parser.add_argument(
+        "--use-volta32",
         action="store_true",
-        help="Whether to not attempt to resume from the checkpoint directory. ",
-    )
-    parser.add_argument("--eval-only", action="store_true", help="perform evaluation only")
-    parser.add_argument("--eval", type=str, default="", help="Eval type to perform")
-    parser.add_argument(
-        "opts",
-        help="""
-Modify config options at the end of the command. For Yacs configs, use
-space-separated "PATH.KEY VALUE" pairs.
-For python-based LazyConfig, use "path.key=value".
-        """.strip(),
-        default=None,
-        nargs=argparse.REMAINDER,
+        help="Request V100-32GB GPUs",
     )
     parser.add_argument(
-        "--output-dir",
-        "--output_dir",
+        "--comment",
         default="",
         type=str,
-        help="Output directory to save logs and checkpoints",
+        help="Comment to pass to scheduler, e.g. priority message",
     )
     parser.add_argument(
-        "--img_format",
+        "--exclude",
+        default="",
         type=str,
-        default=".png"
+        help="Nodes to exclude",
     )
-    parser.add_argument(
-        "--max_to_keep",
-        type=int,
-        default=3
-    )
-
-    parser.add_argument(
-        "--save_frequency",
-        type=int,
-        default=3
-    )
-
     return parser
 
 
-def build_optimizer(cfg, params_groups):
-    return torch.optim.AdamW(params_groups, betas=(cfg.optim.adamw_beta1, cfg.optim.adamw_beta2))
+def get_shared_folder() -> Path:
+    user_checkpoint_path = get_user_checkpoint_path()
+    if user_checkpoint_path is None:
+        raise RuntimeError("Path to user checkpoint cannot be determined")
+    path = user_checkpoint_path / "experiments"
+    path.mkdir(exist_ok=True)
+    return path
 
 
-def build_schedulers(cfg):
-    OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
-    lr = dict(
-        base_value=cfg.optim["lr"],
-        final_value=cfg.optim["min_lr"],
-        total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
-        warmup_iters=cfg.optim["warmup_epochs"] * OFFICIAL_EPOCH_LENGTH,
-        start_warmup_value=0,
+def submit_jobs(task_class, args, name: str):
+
+    if not args.output_dir:
+        args.output_dir = str(get_shared_folder() / "%j")
+
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    executor = submitit.AutoExecutor(folder=args.output_dir, slurm_max_num_timeout=30)
+
+    kwargs = {}
+
+    kwargs["slurm_constraint"]="l40s"
+    if args.use_volta32:
+        kwargs["slurm_constraint"] = "volta32gb"
+    if args.comment:
+        kwargs["slurm_comment"] = args.comment
+    if args.exclude:
+        kwargs["slurm_exclude"] = args.exclude
+    #additional_parameters = {
+    #    "nodelist": "gpu3106"  # Specify the desired node
+    #}
+
+    executor_params = get_slurm_executor_parameters(
+        nodes=args.nodes,
+        num_gpus_per_node=args.ngpus,
+        timeout_min=args.timeout,  # max is 60 * 72
+        slurm_signal_delay_s=120,
+        slurm_partition=args.partition,
+        #slurm_additional_parameters=additional_parameters,
+        **kwargs,
     )
-    wd = dict(
-        base_value=cfg.optim["weight_decay"],
-        final_value=cfg.optim["weight_decay_end"],
-        total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
-    )
-    momentum = dict(
-        base_value=cfg.teacher["momentum_teacher"],
-        final_value=cfg.teacher["final_momentum_teacher"],
-        total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
-    )
-    teacher_temp = dict(
-        base_value=cfg.teacher["teacher_temp"],
-        final_value=cfg.teacher["teacher_temp"],
-        total_iters=cfg.teacher["warmup_teacher_temp_epochs"] * OFFICIAL_EPOCH_LENGTH,
-        warmup_iters=cfg.teacher["warmup_teacher_temp_epochs"] * OFFICIAL_EPOCH_LENGTH,
-        start_warmup_value=cfg.teacher["warmup_teacher_temp"],
-    )
+    executor.update_parameters(name=name, **executor_params)
 
-    lr_schedule = CosineScheduler(**lr)
-    wd_schedule = CosineScheduler(**wd)
-    momentum_schedule = CosineScheduler(**momentum)
-    teacher_temp_schedule = CosineScheduler(**teacher_temp)
-    last_layer_lr_schedule = CosineScheduler(**lr)
+    task = task_class(args)
+    job = executor.submit(task)
 
-    last_layer_lr_schedule.schedule[
-        : cfg.optim["freeze_last_layer_epochs"] * OFFICIAL_EPOCH_LENGTH
-    ] = 0  # mimicking the original schedules
-
-    logger.info("Schedulers ready.")
-
-    return (
-        lr_schedule,
-        wd_schedule,
-        momentum_schedule,
-        teacher_temp_schedule,
-        last_layer_lr_schedule,
-    )
-
-
-def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
-    for param_group in optimizer.param_groups:
-        is_last_layer = param_group["is_last_layer"]
-        lr_multiplier = param_group["lr_multiplier"]
-        wd_multiplier = param_group["wd_multiplier"]
-        param_group["weight_decay"] = wd * wd_multiplier
-        param_group["lr"] = (last_layer_lr if is_last_layer else lr) * lr_multiplier
-
-
-def do_test(cfg, model, iteration):
-    new_state_dict = model.teacher.state_dict()
-
-    if distributed.is_main_process():
-        iterstring = str(iteration)
-        eval_dir = os.path.join(cfg.train.output_dir, "eval", iterstring)
-        os.makedirs(eval_dir, exist_ok=True)
-        # save teacher checkpoint
-        teacher_ckp_path = os.path.join(eval_dir, "teacher_checkpoint.pth")
-        torch.save({"teacher": new_state_dict}, teacher_ckp_path)
-
-
-def do_train(cfg, model, resume=False, max_to_keep=3, save_frequency=3):
-    model.train()
-    inputs_dtype = torch.half
-    fp16_scaler = model.fp16_scaler  # for mixed precision training
-
-    # setup optimizer
-
-    optimizer = build_optimizer(cfg, model.get_params_groups())
-    (
-        lr_schedule,
-        wd_schedule,
-        momentum_schedule,
-        teacher_temp_schedule,
-        last_layer_lr_schedule,
-    ) = build_schedulers(cfg)
-
-    # checkpointer
-    checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=True)
-    rank = distributed.get_global_rank()
-    if resume:
-        start_iter = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
-    else:
-        if len(cfg.MODEL.WEIGHTS) != 0:
-            start_iter = checkpointer.resume_or_load(f"output_gauss255-denoised/model_0074999.rank_{rank}.pth", resume=resume).get("iteration", -1) + 1
-        start_iter = 0
-
-    OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
-    max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
-
-    periodic_checkpointer = PeriodicCheckpointer(
-        checkpointer,
-        #period=5 * OFFICIAL_EPOCH_LENGTH,
-        period=save_frequency * OFFICIAL_EPOCH_LENGTH,
-        max_iter=max_iter,
-        max_to_keep=max_to_keep,
-        #max_to_keep=45,
-    )
-
-    # setup data preprocessing
-
-    img_size = cfg.crops.global_crops_size
-    patch_size = cfg.student.patch_size
-    n_tokens = (img_size // patch_size) ** 2
-    mask_generator = MaskingGenerator(
-        input_size=(img_size // patch_size, img_size // patch_size),
-        max_num_patches=0.5 * img_size // patch_size * img_size // patch_size,
-    )
-
-    data_transform = DataAugmentationDINO(
-        cfg.crops.global_crops_scale,
-        cfg.crops.local_crops_scale,
-        cfg.crops.local_crops_number,
-        global_crops_size=cfg.crops.global_crops_size,
-        local_crops_size=cfg.crops.local_crops_size,
-    )
-
-    collate_fn = partial(
-        collate_data_and_cast,
-        mask_ratio_tuple=cfg.ibot.mask_ratio_min_max,
-        mask_probability=cfg.ibot.mask_sample_probability,
-        n_tokens=n_tokens,
-        mask_generator=mask_generator,
-        dtype=inputs_dtype,
-    )
-
-    # setup data loader
-
-    dataset = make_dataset(
-        dataset_str=cfg.train.dataset_path,
-        transform=data_transform,
-        target_transform=lambda _: (),
-    )
-    #dataset.set_epoch(0)
-    # sampler_type = SamplerType.INFINITE
-    sampler_type = SamplerType.SHARDED_INFINITE
-    data_loader = make_data_loader(
-        dataset=dataset,
-        batch_size=cfg.train.batch_size_per_gpu,
-        num_workers=cfg.train.num_workers,
-        shuffle=True,
-        seed=start_iter,  # TODO: Fix this -- cfg.train.seed
-        sampler_type=sampler_type,
-        sampler_advance=0,  # TODO(qas): fix this -- start_iter * cfg.train.batch_size_per_gpu,
-        drop_last=True,
-        collate_fn=collate_fn,
-    )
-
-    # training loop
-
-    iteration = start_iter
-
-    logger.info("Starting training from iteration {}".format(start_iter))
-    metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
-    metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
-    header = "Training"
-    #n_iter = 0
-    for data in metric_logger.log_every(
-        data_loader,
-        10,
-        header,
-        max_iter,
-        start_iter,
-    ):
-        current_batch_size = data["collated_global_crops"].shape[0] / 2
-        if iteration > max_iter:
-            return
-
-        # apply schedules
-
-        lr = lr_schedule[iteration]
-        wd = wd_schedule[iteration]
-        mom = momentum_schedule[iteration]
-        teacher_temp = teacher_temp_schedule[iteration]
-        last_layer_lr = last_layer_lr_schedule[iteration]
-        apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
-
-        # compute losses
-
-        optimizer.zero_grad(set_to_none=True)
-        loss_dict = model.forward_backward(data, teacher_temp=teacher_temp)
-
-        # clip gradients
-
-        if fp16_scaler is not None:
-            if cfg.optim.clip_grad:
-                fp16_scaler.unscale_(optimizer)
-                for v in model.student.values():
-                    v.clip_grad_norm_(cfg.optim.clip_grad)
-            fp16_scaler.step(optimizer)
-            fp16_scaler.update()
-        else:
-            if cfg.optim.clip_grad:
-                for v in model.student.values():
-                    v.clip_grad_norm_(cfg.optim.clip_grad)
-            optimizer.step()
-
-        # perform teacher EMA update
-
-        model.update_teacher(mom)
-
-        # logging
-
-        if distributed.get_global_size() > 1:
-            for v in loss_dict.values():
-                torch.distributed.all_reduce(v)
-        loss_dict_reduced = {k: v.item() / distributed.get_global_size() for k, v in loss_dict.items()}
-
-        if math.isnan(sum(loss_dict_reduced.values())):
-            logger.info("NaN detected")
-            raise AssertionError
-        losses_reduced = sum(loss for loss in loss_dict_reduced.values())
-
-        metric_logger.update(lr=lr)
-        metric_logger.update(wd=wd)
-        metric_logger.update(mom=mom)
-        metric_logger.update(last_layer_lr=last_layer_lr)
-        metric_logger.update(current_batch_size=current_batch_size)
-        metric_logger.update(total_loss=losses_reduced, **loss_dict_reduced)
-
-        # checkpointing and testing
-
-        if cfg.evaluation.eval_period_iterations > 0 and (iteration + 1) % cfg.evaluation.eval_period_iterations == 0:
-            do_test(cfg, model, f"training_{iteration}")
-            torch.cuda.synchronize()
-        periodic_checkpointer.step(iteration)
-
-        iteration = iteration + 1
-        #n_iter += 1
-        #dataset.set_epoch(n_iter // OFFICIAL_EPOCH_LENGTH)
-    metric_logger.synchronize_between_processes()
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
-
-
-def main(args):
-    cfg = setup(args)
-
-    model = SSLMetaArch(cfg).to(torch.device("cuda"))
-    model.prepare_for_distributed_training()
-    _Split.img_format = args.img_format
-
-    logger.info("Model:\n{}".format(model))
-    if args.eval_only:
-        iteration = (
-            FSDPCheckpointer(model, save_dir=cfg.train.output_dir)
-            .resume_or_load(cfg.MODEL.WEIGHTS, resume=args.resume)
-            .get("iteration", -1)
-            + 1
-        )
-        return do_test(cfg, model, f"manual_{iteration}")
-
-    do_train(cfg, model, resume=args.resume, max_to_keep=args.max_to_keep, save_frequency=args.save_frequency)
-
-
-if __name__ == "__main__":
-    args = get_args_parser(add_help=True).parse_args()
-    main(args)
+    logger.info(f"Submitted job_id: {job.job_id}")
+    str_output_dir = os.path.abspath(args.output_dir).replace("%j", str(job.job_id))
+    logger.info(f"Logs and checkpoints will be saved at: {str_output_dir}")
