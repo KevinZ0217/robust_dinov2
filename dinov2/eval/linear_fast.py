@@ -31,7 +31,65 @@ from dinov2.data.datasets.image_net import _Split
 
 logger = logging.getLogger("dinov2")
 
+###############################################################################
+# Helper: Classwise Accuracy Metric
+###############################################################################
+class ClasswiseAccuracyMetric:
+    """
+    Accumulates a confusion matrix and computes per-class accuracy.
+    """
+    def __init__(self, num_classes: int):
+        self.num_classes = num_classes
+        # confusion_matrix[i, j] = number of samples with true label i predicted as j
+        self.confusion_matrix = torch.zeros(num_classes, num_classes)
 
+    @torch.no_grad()
+    def update(self, preds: torch.Tensor, targets: torch.Tensor):
+        """
+        Args:
+            preds: logits or probabilities of shape [B, num_classes]
+            targets: ground truth labels of shape [B]
+        """
+        predicted_labels = preds.argmax(dim=1)
+        for t, p in zip(targets, predicted_labels):
+            self.confusion_matrix[t.long(), p.long()] += 1
+
+    def finalize(self):
+        """
+        Computes per-class accuracy and mean accuracy.
+        Returns:
+            A dictionary with keys 'per_class_accuracy' and 'mean_accuracy'.
+        """
+        per_class_acc = self.confusion_matrix.diag() / (self.confusion_matrix.sum(dim=1).clamp(min=1))
+        return {
+            "per_class_accuracy": per_class_acc.tolist(),
+            "mean_accuracy": per_class_acc.mean().item()
+        }
+
+###############################################################################
+# Helper: Parse ImageNet-C Dataset Key
+###############################################################################
+def parse_imagenetc_key(dataset_str: str) -> str:
+    """
+    Parses an ImageNet-C dataset string and returns a key in the format corruption_severity,
+    e.g., 'glass_blur_1'. If the string does not follow the expected format, returns the original string.
+    """
+    if "imagenet-c" in dataset_str.lower():
+        corruption = None
+        severity = None
+        parts = dataset_str.split(":")
+        for part in parts:
+            if part.startswith("corruption="):
+                corruption = part.split("=")[1]
+            elif part.startswith("severity="):
+                severity = part.split("=")[1]
+        if corruption is not None and severity is not None:
+            return f"{corruption}_{severity}"
+    return dataset_str
+
+###############################################################################
+# Argument Parser
+###############################################################################
 def get_args_parser(
     description: Optional[str] = None,
     parents: Optional[List[argparse.ArgumentParser]] = None,
@@ -77,7 +135,7 @@ def get_args_parser(
     parser.add_argument(
         "--num-workers",
         type=int,
-        help="Number de Workers",
+        help="Number of Workers",
     )
     parser.add_argument(
         "--epoch-length",
@@ -158,14 +216,14 @@ def get_args_parser(
     )
     return parser
 
-
+###############################################################################
+# Miscellaneous Helper Functions
+###############################################################################
 def has_ddp_wrapper(m: nn.Module) -> bool:
     return isinstance(m, DistributedDataParallel)
 
-
 def remove_ddp_wrapper(m: nn.Module) -> nn.Module:
     return m.module if has_ddp_wrapper(m) else m
-
 
 def _pad_and_collate(batch):
     maxlen = max(len(targets) for image, targets in batch)
@@ -173,7 +231,6 @@ def _pad_and_collate(batch):
         (image, np.pad(targets, (0, maxlen - len(targets)), constant_values=-1)) for image, targets in batch
     ]
     return torch.utils.data.default_collate(padded_batch)
-
 
 def create_linear_input(x_tokens_list, use_n_blocks, use_avgpool):
     intermediate_output = x_tokens_list[-use_n_blocks:]
@@ -189,7 +246,9 @@ def create_linear_input(x_tokens_list, use_n_blocks, use_avgpool):
         output = output.reshape(output.shape[0], -1)
     return output.float()
 
-
+###############################################################################
+# Linear Classifier Definitions
+###############################################################################
 class LinearClassifier(nn.Module):
     """Linear layer to train on top of frozen features"""
 
@@ -207,7 +266,6 @@ class LinearClassifier(nn.Module):
         output = create_linear_input(x_tokens_list, self.use_n_blocks, self.use_avgpool)
         return self.linear(output)
 
-
 class AllClassifiers(nn.Module):
     def __init__(self, classifiers_dict):
         super().__init__()
@@ -219,7 +277,6 @@ class AllClassifiers(nn.Module):
 
     def __len__(self):
         return len(self.classifiers_dict)
-
 
 class LinearPostprocessor(nn.Module):
     def __init__(self, linear_classifier, class_mapping=None):
@@ -234,10 +291,11 @@ class LinearPostprocessor(nn.Module):
             "target": targets,
         }
 
-
+###############################################################################
+# Learning Rate Scaling and Classifier Setup
+###############################################################################
 def scale_lr(learning_rates, batch_size):
     return learning_rates * (batch_size * distributed.get_global_size()) / 256.0
-
 
 def setup_linear_classifiers(sample_output, n_last_blocks_list, learning_rates, batch_size, num_classes=1000):
     linear_classifiers_dict = nn.ModuleDict()
@@ -251,9 +309,8 @@ def setup_linear_classifiers(sample_output, n_last_blocks_list, learning_rates, 
                     out_dim, use_n_blocks=n, use_avgpool=avgpool, num_classes=num_classes
                 )
                 linear_classifier = linear_classifier.cuda()
-                linear_classifiers_dict[
-                    f"classifier_{n}_blocks_avgpool_{avgpool}_lr_{lr:.5f}".replace(".", "_")
-                ] = linear_classifier
+                classifier_name = f"classifier_{n}_blocks_avgpool_{avgpool}_lr_{lr:.5f}".replace(".", "_")
+                linear_classifiers_dict[classifier_name] = linear_classifier
                 optim_param_groups.append({"params": linear_classifier.parameters(), "lr": lr})
 
     linear_classifiers = AllClassifiers(linear_classifiers_dict)
@@ -262,7 +319,9 @@ def setup_linear_classifiers(sample_output, n_last_blocks_list, learning_rates, 
 
     return linear_classifiers, optim_param_groups
 
-
+###############################################################################
+# Modified Evaluation: Added Class-wise Accuracy
+###############################################################################
 @torch.no_grad()
 def evaluate_linear_classifiers(
     feature_model,
@@ -295,17 +354,33 @@ def evaluate_linear_classifiers(
     results_dict = {}
     max_accuracy = 0
     best_classifier = ""
-    for i, (classifier_string, metric) in enumerate(results_dict_temp.items()):
-        logger.info(f"{prefixstring} -- Classifier: {classifier_string} * {metric}")
-        if (
-            best_classifier_on_val is None and metric["top-1"].item() > max_accuracy
-        ) or classifier_string == best_classifier_on_val:
-            max_accuracy = metric["top-1"].item()
+    for i, (classifier_string, met) in enumerate(results_dict_temp.items()):
+        logger.info(f"{prefixstring} -- Classifier: {classifier_string} * {met}")
+        if (best_classifier_on_val is None and met["top-1"].item() > max_accuracy) or classifier_string == best_classifier_on_val:
+            max_accuracy = met["top-1"].item()
             best_classifier = classifier_string
 
     results_dict["best_classifier"] = {"name": best_classifier, "accuracy": max_accuracy}
 
     logger.info(f"best classifier: {results_dict['best_classifier']}")
+
+    # -----------------------------
+    # Compute class-wise accuracy for the best classifier
+    # -----------------------------
+    classwise_metric = ClasswiseAccuracyMetric(num_classes=training_num_classes)
+    with torch.no_grad():
+        for samples, targets in data_loader:
+            samples = samples.cuda(non_blocking=True)
+            targets = targets.cuda(non_blocking=True)
+            best_postprocessor = postprocessors[best_classifier]
+            results = best_postprocessor(feature_model(samples), targets)
+            preds = results["preds"]  # shape [B, num_classes]
+            targs = results["target"]  # shape [B]
+            classwise_metric.update(preds, targs)
+    classwise_results = classwise_metric.finalize()
+    logger.info(f"Per-class accuracy: {classwise_results['per_class_accuracy']}")
+    logger.info(f"Mean class accuracy: {classwise_results['mean_accuracy']:.2f}")
+    # -----------------------------
 
     if distributed.is_main_process():
         with open(metrics_file_path, "a") as f:
@@ -316,6 +391,60 @@ def evaluate_linear_classifiers(
 
     return results_dict
 
+###############################################################################
+# Other Evaluation and Testing Functions
+###############################################################################
+def make_eval_data_loader(test_dataset_str, batch_size, num_workers, metric_type):
+    test_dataset = make_dataset(
+        dataset_str=test_dataset_str,
+        transform=make_classification_eval_transform(),
+    )
+    test_data_loader = make_data_loader(
+        dataset=test_dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        sampler_type=SamplerType.DISTRIBUTED,
+        drop_last=False,
+        shuffle=False,
+        persistent_workers=False,
+        collate_fn=_pad_and_collate if metric_type == MetricType.IMAGENET_REAL_ACCURACY else None,
+    )
+    return test_data_loader
+
+def test_on_datasets(
+    feature_model,
+    linear_classifiers,
+    test_dataset_strs,
+    batch_size,
+    num_workers,
+    test_metric_types,
+    metrics_file_path,
+    training_num_classes,
+    iteration,
+    best_classifier_on_val,
+    prefixstring="",
+    test_class_mappings=[None],
+):
+    results_dict = {}
+    for test_dataset_str, class_mapping, metric_type in zip(test_dataset_strs, test_class_mappings, test_metric_types):
+        logger.info(f"Testing on {test_dataset_str}")
+        test_data_loader = make_eval_data_loader(test_dataset_str, batch_size, num_workers, metric_type)
+        dataset_results_dict = evaluate_linear_classifiers(
+            feature_model,
+            remove_ddp_wrapper(linear_classifiers),
+            test_data_loader,
+            metric_type,
+            metrics_file_path,
+            training_num_classes,
+            iteration,
+            prefixstring="",
+            class_mapping=class_mapping,
+            best_classifier_on_val=best_classifier_on_val,
+        )
+        # Generate a key like "glass_blur_1" using the helper
+        key = parse_imagenetc_key(test_dataset_str)
+        results_dict[key] = 100.0 * dataset_results_dict["best_classifier"]["accuracy"]
+    return results_dict
 
 def eval_linear(
     *,
@@ -328,7 +457,7 @@ def eval_linear(
     scheduler,
     output_dir,
     max_iter,
-    checkpoint_period,  # In number of iter, creates a new file every period
+    checkpoint_period,  # In number of iterations, creates a new file every period
     running_checkpoint_period,  # Period to update main checkpoint file
     eval_period,
     metric_type,
@@ -362,15 +491,12 @@ def eval_linear(
         losses = {f"loss_{k}": nn.CrossEntropyLoss()(v, labels) for k, v in outputs.items()}
         loss = sum(losses.values())
 
-        # compute the gradients
         optimizer.zero_grad()
         loss.backward()
 
-        # step
         optimizer.step()
         scheduler.step()
 
-        # log
         if iteration % 10 == 0:
             torch.cuda.synchronize()
             metric_logger.update(loss=loss.item())
@@ -414,59 +540,6 @@ def eval_linear(
     )
     return val_results_dict, feature_model, linear_classifiers, iteration
 
-
-def make_eval_data_loader(test_dataset_str, batch_size, num_workers, metric_type):
-    test_dataset = make_dataset(
-        dataset_str=test_dataset_str,
-        transform=make_classification_eval_transform(),
-    )
-    test_data_loader = make_data_loader(
-        dataset=test_dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        sampler_type=SamplerType.DISTRIBUTED,
-        drop_last=False,
-        shuffle=False,
-        persistent_workers=False,
-        collate_fn=_pad_and_collate if metric_type == MetricType.IMAGENET_REAL_ACCURACY else None,
-    )
-    return test_data_loader
-
-
-def test_on_datasets(
-    feature_model,
-    linear_classifiers,
-    test_dataset_strs,
-    batch_size,
-    num_workers,
-    test_metric_types,
-    metrics_file_path,
-    training_num_classes,
-    iteration,
-    best_classifier_on_val,
-    prefixstring="",
-    test_class_mappings=[None],
-):
-    results_dict = {}
-    for test_dataset_str, class_mapping, metric_type in zip(test_dataset_strs, test_class_mappings, test_metric_types):
-        logger.info(f"Testing on {test_dataset_str}")
-        test_data_loader = make_eval_data_loader(test_dataset_str, batch_size, num_workers, metric_type)
-        dataset_results_dict = evaluate_linear_classifiers(
-            feature_model,
-            remove_ddp_wrapper(linear_classifiers),
-            test_data_loader,
-            metric_type,
-            metrics_file_path,
-            training_num_classes,
-            iteration,
-            prefixstring="",
-            class_mapping=class_mapping,
-            best_classifier_on_val=best_classifier_on_val,
-        )
-        results_dict[f"{test_dataset_str}_accuracy"] = 100.0 * dataset_results_dict["best_classifier"]["accuracy"]
-    return results_dict
-
-
 def run_eval_linear(
     model,
     output_dir,
@@ -505,7 +578,6 @@ def run_eval_linear(
     )
     training_num_classes = len(torch.unique(torch.Tensor(train_dataset.get_targets().astype(int))))
     sampler_type = SamplerType.SHARDED_INFINITE
-    # sampler_type = SamplerType.INFINITE
 
     n_last_blocks_list = [1, 4]
     n_last_blocks = max(n_last_blocks_list)
@@ -583,7 +655,7 @@ def run_eval_linear(
             linear_classifiers,
             test_dataset_strs,
             batch_size,
-            0,  # num_workers,
+            0,  # num_workers
             test_metric_types,
             metrics_file_path,
             training_num_classes,
@@ -597,7 +669,6 @@ def run_eval_linear(
     logger.info("Test Results Dict " + str(results_dict))
 
     return results_dict
-
 
 def main(args):
     model, autocast_dtype = setup_and_build_model(args)
@@ -625,7 +696,6 @@ def main(args):
         test_class_mapping_fpaths=args.test_class_mapping_fpaths,
     )
     return 0
-
 
 if __name__ == "__main__":
     description = "DINOv2 linear evaluation"

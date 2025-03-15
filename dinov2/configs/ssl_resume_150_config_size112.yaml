@@ -1,5 +1,6 @@
 MODEL:
-  WEIGHTS: ''
+  WEIGHTS: 'output_clean-200_size112/model_0187499.rank_0.pth'
+  # WEIGHTS: ''
 compute_precision:
   grad_scaler: true
   teacher:
@@ -90,7 +91,7 @@ teacher:
   teacher_temp: 0.07
   warmup_teacher_temp_epochs: 30
 optim:
-  epochs: 100
+  epochs: 50
   weight_decay: 0.04
   weight_decay_end: 0.4
   base_lr: 0.004  # learning rate for a batch size of 1024

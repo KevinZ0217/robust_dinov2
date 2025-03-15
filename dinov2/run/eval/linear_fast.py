@@ -139,6 +139,12 @@ def get_args_parser(
         type=str,
         default=".png"
     )
+    # New flag to bypass training and run evaluation only
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="If set, bypass training and run evaluation only using the classifier checkpoint."
+    )
     parser.set_defaults(
         train_dataset_str="ImageNet:split=TRAIN",
         val_dataset_str="ImageNet:split=VAL",
@@ -295,12 +301,12 @@ def evaluate_linear_classifiers(
     results_dict = {}
     max_accuracy = 0
     best_classifier = ""
-    for i, (classifier_string, metric) in enumerate(results_dict_temp.items()):
-        logger.info(f"{prefixstring} -- Classifier: {classifier_string} * {metric}")
+    for i, (classifier_string, metric_dict) in enumerate(results_dict_temp.items()):
+        logger.info(f"{prefixstring} -- Classifier: {classifier_string} * {metric_dict}")
         if (
-            best_classifier_on_val is None and metric["top-1"].item() > max_accuracy
+            best_classifier_on_val is None and metric_dict["top-1"].item() > max_accuracy
         ) or classifier_string == best_classifier_on_val:
-            max_accuracy = metric["top-1"].item()
+            max_accuracy = metric_dict["top-1"].item()
             best_classifier = classifier_string
 
     results_dict["best_classifier"] = {"name": best_classifier, "accuracy": max_accuracy}
@@ -362,15 +368,12 @@ def eval_linear(
         losses = {f"loss_{k}": nn.CrossEntropyLoss()(v, labels) for k, v in outputs.items()}
         loss = sum(losses.values())
 
-        # compute the gradients
         optimizer.zero_grad()
         loss.backward()
 
-        # step
         optimizer.step()
         scheduler.step()
 
-        # log
         if iteration % 10 == 0:
             torch.cuda.synchronize()
             metric_logger.update(loss=loss.item())
@@ -467,6 +470,76 @@ def test_on_datasets(
     return results_dict
 
 
+# New function: Evaluation-Only mode (bypassing training)
+@torch.no_grad()
+def run_eval_only(
+    model,
+    output_dir,
+    val_dataset_str,   # This will be your ImageNet-C dataset string
+    batch_size,
+    num_workers,
+    val_metric_type=MetricType.MEAN_ACCURACY,
+    classifier_fpath=None,
+    val_class_mapping_fpath=None,
+    autocast_dtype=torch.float16,  # Adjust as needed
+):
+    logger.info("Running evaluation-only mode.")
+    # Create evaluation data loader for your ImageNet-C dataset.
+    val_data_loader = make_eval_data_loader(val_dataset_str, batch_size, num_workers, val_metric_type)
+
+    # Initialize the feature extractor.
+    n_last_blocks_list = [1, 4]
+    n_last_blocks = max(n_last_blocks_list)
+    autocast_ctx = partial(torch.cuda.amp.autocast, enabled=True, dtype=autocast_dtype)
+    feature_model = ModelWithIntermediateLayers(model, n_last_blocks, autocast_ctx)
+
+    # Get a sample from the evaluation dataset to determine the output shape.
+    sample, _ = next(iter(val_data_loader))
+    sample = sample.cuda(non_blocking=True)
+    if sample.dim() == 3:
+        sample = sample.unsqueeze(0)
+    sample_output = feature_model(sample)
+
+    # Set up the linear classifier architecture (same as used in training).
+    # Dummy learning rate value is provided; it is unused in eval.
+    linear_classifiers, _ = setup_linear_classifiers(
+        sample_output,
+        n_last_blocks_list,
+        learning_rates=[1e-5],
+        batch_size=batch_size,
+        num_classes=1000,
+    )
+
+    # Load the pretrained checkpoint.
+    checkpointer = Checkpointer(linear_classifiers, output_dir)
+    checkpointer.resume_or_load(classifier_fpath or "", resume=True)
+
+    # Optionally, load the class mapping if provided.
+    if val_class_mapping_fpath is not None:
+        logger.info(f"Using class mapping from {val_class_mapping_fpath}")
+        val_class_mapping = np.load(val_class_mapping_fpath)
+    else:
+        val_class_mapping = None
+
+    # Define a metrics file path (if needed).
+    metrics_file_path = os.path.join(output_dir, "results_eval_only.json")
+
+    # Run evaluation on the validation (ImageNet-C) dataset.
+    val_results_dict = evaluate_linear_classifiers(
+        feature_model=feature_model,
+        linear_classifiers=remove_ddp_wrapper(linear_classifiers),
+        data_loader=val_data_loader,
+        metrics_file_path=metrics_file_path,
+        metric_type=val_metric_type,
+        training_num_classes=1000,
+        iteration=0,
+        class_mapping=val_class_mapping,
+    )
+
+    logger.info("Evaluation-Only Results: " + str(val_results_dict))
+    return val_results_dict
+
+
 def run_eval_linear(
     model,
     output_dir,
@@ -505,7 +578,6 @@ def run_eval_linear(
     )
     training_num_classes = len(torch.unique(torch.Tensor(train_dataset.get_targets().astype(int))))
     sampler_type = SamplerType.SHARDED_INFINITE
-    # sampler_type = SamplerType.INFINITE
 
     n_last_blocks_list = [1, 4]
     n_last_blocks = max(n_last_blocks_list)
@@ -603,27 +675,41 @@ def main(args):
     model, autocast_dtype = setup_and_build_model(args)
     _Split.img_format = args.img_format
     print("num_workers:", args.num_workers)
-    run_eval_linear(
-        model=model,
-        output_dir=args.output_dir,
-        train_dataset_str=args.train_dataset_str,
-        val_dataset_str=args.val_dataset_str,
-        test_dataset_strs=args.test_dataset_strs,
-        batch_size=args.batch_size,
-        epochs=args.epochs,
-        epoch_length=args.epoch_length,
-        num_workers=args.num_workers,
-        save_checkpoint_frequency=args.save_checkpoint_frequency,
-        eval_period_iterations=args.eval_period_iterations,
-        learning_rates=args.learning_rates,
-        autocast_dtype=autocast_dtype,
-        resume=not args.no_resume,
-        classifier_fpath=args.classifier_fpath,
-        val_metric_type=args.val_metric_type,
-        test_metric_types=args.test_metric_types,
-        val_class_mapping_fpath=args.val_class_mapping_fpath,
-        test_class_mapping_fpaths=args.test_class_mapping_fpaths,
-    )
+    if args.eval_only:
+        # Bypass training and run evaluation only on the validation dataset.
+        run_eval_only(
+            model=model,
+            output_dir=args.output_dir,
+            val_dataset_str=args.val_dataset_str,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            val_metric_type=args.val_metric_type,
+            classifier_fpath=args.classifier_fpath,
+            val_class_mapping_fpath=args.val_class_mapping_fpath,
+            autocast_dtype=autocast_dtype,
+        )
+    else:
+        run_eval_linear(
+            model=model,
+            output_dir=args.output_dir,
+            train_dataset_str=args.train_dataset_str,
+            val_dataset_str=args.val_dataset_str,
+            test_dataset_strs=args.test_dataset_strs,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            epoch_length=args.epoch_length,
+            num_workers=args.num_workers,
+            save_checkpoint_frequency=args.save_checkpoint_frequency,
+            eval_period_iterations=args.eval_period_iterations,
+            learning_rates=args.learning_rates,
+            autocast_dtype=autocast_dtype,
+            resume=not args.no_resume,
+            classifier_fpath=args.classifier_fpath,
+            val_metric_type=args.val_metric_type,
+            test_metric_types=args.test_metric_types,
+            val_class_mapping_fpath=args.val_class_mapping_fpath,
+            test_class_mapping_fpaths=args.test_class_mapping_fpaths,
+        )
     return 0
 
 

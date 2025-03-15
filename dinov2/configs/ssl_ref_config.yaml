@@ -1,5 +1,5 @@
 MODEL:
-  WEIGHTS: ''
+  WEIGHTS: 'output_clean/model_final.rank_0.pth'
 compute_precision:
   grad_scaler: true
   teacher:
