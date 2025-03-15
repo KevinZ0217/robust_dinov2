@@ -59,16 +59,17 @@ def get_user_checkpoint_path(cluster_type: Optional[ClusterType] = None) -> Opti
 
 
 def get_slurm_partition(cluster_type: Optional[ClusterType] = None) -> Optional[str]:
-    cluster_type = get_cluster_type(cluster_type)
-    if cluster_type is None:
-        return None
+    return "gpu-he"
+    # cluster_type = get_cluster_type(cluster_type)
+    # if cluster_type is None:
+    #     return None
 
-    SLURM_PARTITIONS = {
-        ClusterType.AWS: "learnlab",
-        ClusterType.FAIR: "learnlab",
-        ClusterType.RSC: "learn",
-    }
-    return SLURM_PARTITIONS[cluster_type]
+    # SLURM_PARTITIONS = {
+    #     ClusterType.AWS: "learnlab",
+    #     ClusterType.FAIR: "learnlab",
+    #     ClusterType.RSC: "learn",
+    # }
+    # return SLURM_PARTITIONS[cluster_type]
 
 
 def get_slurm_executor_parameters(
